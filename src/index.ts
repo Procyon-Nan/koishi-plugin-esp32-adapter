@@ -1049,12 +1049,16 @@ function handleEvent(
         member: undefined,
         guild: undefined,
       },
+      app: ctx,
       text(path: string, params?: any[]) {
         const fallback = path.split(".").pop() || path;
         return params?.length ? `${fallback} ${params.join(" ")}` : fallback;
       },
       async send(content: any) {
         return this.bot.sendMessage(this.channelId, content);
+      },
+      async sendQueued(content: any) {
+        return this.send(content);
       },
       async resolve<T>(value: T) {
         return value;
