@@ -1,4 +1,4 @@
-import { Context, Schema, h } from "koishi";
+import { Bot, Context, Schema, Universal, h } from "koishi";
 import { randomUUID } from "crypto";
 import type {} from "@koishijs/plugin-server";
 
@@ -6,7 +6,6 @@ export const name = "esp32-adapter";
 
 export const inject = {
   required: ["server"],
-  optional: ["chatluna"],
 };
 
 const PROTOCOL_NAME = "Utsuho";
@@ -108,6 +107,106 @@ interface LiveSessionEntry {
   session: SessionState;
 }
 
+const PRIVATE_PFX = "private:";
+
+// DeviceBot：参考 onebot 适配器的方式，使用真实 Koishi Bot 承载消息派发。
+// ChatLuna 将收到真正的 Session，而不是手工拼装的伪 Session。
+class DeviceBot extends Bot<Context, any> {
+  constructor(
+    ctx: Context,
+    private readonly _liveSessions: Map<string, LiveSessionEntry>,
+    private readonly _serverConfig: Config,
+  ) {
+    super(ctx, {} as any, "device");
+    this.selfId = _serverConfig.serverId;
+    this.user.id = _serverConfig.serverId;
+    this.user.name = "Device Bridge";
+  }
+
+  async createDirectChannel(userId: string) {
+    return {
+      id: `${PRIVATE_PFX}${userId}`,
+      type: Universal.Channel.Type.DIRECT,
+    };
+  }
+
+  async sendMessage(channelId: string, content: any) {
+    const deviceId = channelId.startsWith(PRIVATE_PFX)
+      ? channelId.slice(PRIVATE_PFX.length)
+      : channelId;
+
+    const entry = this._liveSessions.get(deviceId);
+    if (!entry?.session.handshakeDone) return [randomUUID()];
+    if (!entry.session.effectiveCapabilities.includes("text_tx")) {
+      return [randomUUID()];
+    }
+
+    const text = extractPlainText(h.normalize(content));
+    if (!text) return [randomUUID()];
+
+    sendMessage(
+      entry.socket,
+      buildMessage(
+        entry.session,
+        this._serverConfig.serverId,
+        "server",
+        "command",
+        "text_send",
+        { text },
+      ),
+    );
+
+    return [randomUUID()];
+  }
+
+  async editMessage(channelId: string, messageId: string, content: any) {
+    return this.sendMessage(channelId, content);
+  }
+
+  async deleteMessage(channelId: string, messageId: string) {}
+}
+
+function createDeviceSession(
+  deviceBot: DeviceBot,
+  session: SessionState,
+  text: string,
+  messageId: string,
+) {
+  const deviceId = session.remoteDeviceId || "unknown-device";
+  const channelId = `${PRIVATE_PFX}${deviceId}`;
+  const next = deviceBot.session();
+
+  next.type = "message";
+  next.subtype = "private";
+  next.subsubtype = "private" as any;
+  next.selfId = deviceBot.selfId;
+  next.userId = deviceId;
+  next.channelId = channelId;
+  next.guildId = undefined;
+  next.isDirect = true;
+  next.content = text;
+  next.username = deviceId;
+  next.author = {
+    user: { id: deviceId, name: deviceId },
+    id: deviceId,
+    name: deviceId,
+    nick: deviceId,
+  } as any;
+  next.event.user = { id: deviceId, name: deviceId } as any;
+  next.event.channel = {
+    id: channelId,
+    type: Universal.Channel.Type.DIRECT,
+  } as any;
+  next.event.message = {
+    id: messageId,
+    content: text,
+  } as any;
+  next.messageId = messageId;
+  next.elements = [h.text(text)] as any;
+
+  return next;
+}
+
 // 从 Koishi h 元素树中递归提取纯文本。
 function extractPlainText(elements: h[]): string {
   return elements
@@ -187,6 +286,12 @@ export function apply(ctx: Context, config: Config) {
   const localCapabilities = getLocalCapabilities(config);
   const sessionSnapshots = new Map<any, SessionSnapshot>();
   const liveSessions = new Map<string, LiveSessionEntry>();
+  const deviceBot = new DeviceBot(ctx, liveSessions, config);
+
+  ctx.effect(() => {
+    deviceBot.online();
+    return () => deviceBot.offline();
+  });
 
   if (serverConfig) {
     serverConfig.host = config.wsHost;
@@ -339,10 +444,10 @@ export function apply(ctx: Context, config: Config) {
           );
           break;
         case "command":
-          handleCommand(logger, socket, session, config, message, ctx);
+          handleCommand(logger, socket, session, config, message, deviceBot);
           break;
         case "event":
-          handleEvent(logger, socket, session, config, message, ctx);
+          handleEvent(logger, socket, session, config, message, deviceBot);
           break;
         case "response":
           logger.info(`收到响应消息 ${message.action} <- ${remoteLabel()}`);
@@ -780,7 +885,7 @@ function handleCommand(
   session: SessionState,
   config: Config,
   message: UtsuhoMessage,
-  ctx?: Context,
+  deviceBot: DeviceBot,
 ) {
   if (message.action === "text_send") {
     if (!session.effectiveCapabilities.includes("text_rx")) {
@@ -813,129 +918,28 @@ function handleCommand(
       ),
     );
 
-    // 若 ChatLuna 可用，将文本转发给 LLM 处理。
-    // 这里不再依赖 Koishi Bot 基类，而是构造一个最小伪 Session 对象：
-    // - 把消息伪装成来自 esp32 平台的私聊
-    // - 用 send() 将 ChatLuna 生成的文本回复经 WebSocket 发回 ESP32
-    //
-    // 前置条件（需在 ChatLuna 配置中开启）：
-    //   - allowPrivate = true
-    //   - privateChatWithoutCommand = true
-    const chatluna = (ctx as any)?.chatluna;
-
     if (!text) {
-      logger.warn("ChatLuna 转发跳过：text 为空");
-      return;
-    }
-
-    if (!chatluna) {
-      logger.warn("ChatLuna 转发跳过：ctx.chatluna 不存在");
+      logger.warn("device Bot 分发跳过：text 为空");
       return;
     }
 
     const deviceId = session.remoteDeviceId || "unknown-device";
-    logger.info(`准备转发给 ChatLuna <- ${deviceId}: ${text}`);
+    logger.info(`准备通过 device Bot 分发命令文本 <- ${deviceId}: ${text}`);
 
-    const koishiSession = {
-      type: "private",
-      subtype: "private",
-      platform: "esp32",
-      selfId: config.serverId,
-      userId: deviceId,
-      channelId: deviceId,
-      guildId: undefined,
-      username: deviceId,
-      content: text,
-      elements: [h.text(text)],
-      isDirect: true,
-      uid: `esp32:${deviceId}`,
-      sid: `esp32:${deviceId}`,
-      stripped: { atSelf: false },
-      quote: undefined,
-      author: {
-        user: { id: deviceId, name: deviceId },
-        id: deviceId,
-        name: deviceId,
-        nick: deviceId,
-      },
-      bot: {
-        selfId: config.serverId,
-        userId: config.serverId,
-        platform: "esp32",
-        async sendMessage(channelId: string, content: any) {
-          const reply = extractPlainText(h.normalize(content));
-          if (!reply) {
-            logger.warn("ChatLuna 回复发送跳过：提取出的 reply 为空");
-            return [randomUUID()];
-          }
-          if (channelId !== deviceId) {
-            logger.warn(
-              `ChatLuna 回复发送跳过：channelId 不匹配 channelId=${channelId} deviceId=${deviceId}`,
-            );
-            return [randomUUID()];
-          }
-          if (!session.effectiveCapabilities.includes("text_tx")) {
-            logger.warn("ChatLuna 回复发送跳过：text_tx 未启用");
-            return [randomUUID()];
-          }
+    const deviceSession = createDeviceSession(
+      deviceBot,
+      session,
+      text,
+      message.id,
+    );
 
-          logger.info(`ChatLuna 回复 -> ${deviceId}: ${reply}`);
-
-          sendMessage(
-            socket,
-            buildMessage(
-              session,
-              config.serverId,
-              "server",
-              "command",
-              "text_send",
-              {
-                text: reply,
-              },
-            ),
-          );
-          return [randomUUID()];
-        },
-        async editMessage(channelId: string, messageId: string, content: any) {
-          return this.sendMessage(channelId, content);
-        },
-        deleteMessage: async () => {},
-      },
-      event: {
-        user: { id: deviceId, name: deviceId },
-        channel: { id: deviceId, type: "private" },
-        member: undefined,
-        guild: undefined,
-      },
-      app: ctx,
-      text(path: string, params?: any[]) {
-        const fallback = path.split(".").pop() || path;
-        return params?.length ? `${fallback} ${params.join(" ")}` : fallback;
-      },
-      async send(content: any) {
-        return this.bot.sendMessage(this.channelId, content);
-      },
-      async sendQueued(content: any) {
-        return this.send(content);
-      },
-      async resolve<T>(value: T) {
-        return value;
-      },
-    } as any;
-
-    chatluna.chatChain
-      .receiveMessage(koishiSession, ctx)
-      .then((handled: boolean) => {
-        logger.info(
-          `ChatLuna receiveMessage 已返回: handled=${handled} device=${deviceId}`,
-        );
-        if (!handled) {
-          logger.warn(
-            "ChatLuna 未处理该消息，常见原因：allowPrivate / privateChatWithoutCommand / 房间解析失败",
-          );
-        }
+    Promise.resolve(deviceBot.dispatch(deviceSession))
+      .then(() => {
+        logger.info(`device Bot 已派发命令文本 -> ${deviceId}`);
       })
-      .catch((err: unknown) => logger.warn(`ChatLuna 处理失败: ${err}`));
+      .catch((err: unknown) =>
+        logger.warn(`device Bot 派发命令文本失败: ${err}`),
+      );
 
     return;
   }
@@ -957,7 +961,7 @@ function handleEvent(
   session: SessionState,
   config: Config,
   message: UtsuhoMessage,
-  ctx?: Context,
+  deviceBot: DeviceBot,
 ) {
   if (message.action === "text_received") {
     const text = String(message.payload.text || "").trim();
@@ -965,119 +969,27 @@ function handleEvent(
     logger.info(`收到文本事件 <- ${session.remoteDeviceId}: ${text}`);
 
     if (!text) {
-      logger.warn("ChatLuna 事件转发跳过：text 为空");
-      return;
-    }
-
-    const chatluna = (ctx as any)?.chatluna;
-    if (!chatluna) {
-      logger.warn("ChatLuna 事件转发跳过：ctx.chatluna 不存在");
+      logger.warn("device Bot 分发跳过：text 为空");
       return;
     }
 
     const deviceId = session.remoteDeviceId || "unknown-device";
-    logger.info(`准备将文本事件转发给 ChatLuna <- ${deviceId}: ${text}`);
+    logger.info(`准备通过 device Bot 分发文本事件 <- ${deviceId}: ${text}`);
 
-    const koishiSession = {
-      type: "private",
-      subtype: "private",
-      platform: "esp32",
-      selfId: config.serverId,
-      userId: deviceId,
-      channelId: deviceId,
-      guildId: undefined,
-      username: deviceId,
-      content: text,
-      elements: [h.text(text)],
-      isDirect: true,
-      uid: `esp32:${deviceId}`,
-      sid: `esp32:${deviceId}`,
-      stripped: { atSelf: false },
-      quote: undefined,
-      author: {
-        user: { id: deviceId, name: deviceId },
-        id: deviceId,
-        name: deviceId,
-        nick: deviceId,
-      },
-      bot: {
-        selfId: config.serverId,
-        userId: config.serverId,
-        platform: "esp32",
-        async sendMessage(channelId: string, content: any) {
-          const reply = extractPlainText(h.normalize(content));
-          if (!reply) {
-            logger.warn("ChatLuna 事件回复发送跳过：提取出的 reply 为空");
-            return [randomUUID()];
-          }
-          if (channelId !== deviceId) {
-            logger.warn(
-              `ChatLuna 事件回复发送跳过：channelId 不匹配 channelId=${channelId} deviceId=${deviceId}`,
-            );
-            return [randomUUID()];
-          }
-          if (!session.effectiveCapabilities.includes("text_tx")) {
-            logger.warn("ChatLuna 事件回复发送跳过：text_tx 未启用");
-            return [randomUUID()];
-          }
+    const deviceSession = createDeviceSession(
+      deviceBot,
+      session,
+      text,
+      message.id,
+    );
 
-          logger.info(`ChatLuna 事件回复 -> ${deviceId}: ${reply}`);
-
-          sendMessage(
-            socket,
-            buildMessage(
-              session,
-              config.serverId,
-              "server",
-              "command",
-              "text_send",
-              {
-                text: reply,
-              },
-            ),
-          );
-          return [randomUUID()];
-        },
-        async editMessage(channelId: string, messageId: string, content: any) {
-          return this.sendMessage(channelId, content);
-        },
-        deleteMessage: async () => {},
-      },
-      event: {
-        user: { id: deviceId, name: deviceId },
-        channel: { id: deviceId, type: "private" },
-        member: undefined,
-        guild: undefined,
-      },
-      app: ctx,
-      text(path: string, params?: any[]) {
-        const fallback = path.split(".").pop() || path;
-        return params?.length ? `${fallback} ${params.join(" ")}` : fallback;
-      },
-      async send(content: any) {
-        return this.bot.sendMessage(this.channelId, content);
-      },
-      async sendQueued(content: any) {
-        return this.send(content);
-      },
-      async resolve<T>(value: T) {
-        return value;
-      },
-    } as any;
-
-    chatluna.chatChain
-      .receiveMessage(koishiSession, ctx)
-      .then((handled: boolean) => {
-        logger.info(
-          `ChatLuna receiveMessage(事件) 已返回: handled=${handled} device=${deviceId}`,
-        );
-        if (!handled) {
-          logger.warn(
-            "ChatLuna 未处理该文本事件，常见原因：allowPrivate / privateChatWithoutCommand / 房间解析失败",
-          );
-        }
+    Promise.resolve(deviceBot.dispatch(deviceSession))
+      .then(() => {
+        logger.info(`device Bot 已派发文本事件 -> ${deviceId}`);
       })
-      .catch((err: unknown) => logger.warn(`ChatLuna 事件处理失败: ${err}`));
+      .catch((err: unknown) =>
+        logger.warn(`device Bot 派发文本事件失败: ${err}`),
+      );
 
     return;
   }
