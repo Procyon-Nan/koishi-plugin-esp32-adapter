@@ -159,7 +159,7 @@ class DeviceBot extends Bot<Context, any> {
   }
 
   async editMessage(channelId: string, messageId: string, content: any) {
-    return this.sendMessage(channelId, content);
+    await this.sendMessage(channelId, content);
   }
 
   async deleteMessage(channelId: string, messageId: string) {}
@@ -177,7 +177,6 @@ function createDeviceSession(
 
   next.type = "message";
   next.subtype = "private";
-  next.subsubtype = "private" as any;
   next.selfId = deviceBot.selfId;
   next.userId = deviceId;
   next.channelId = channelId;
@@ -185,13 +184,7 @@ function createDeviceSession(
   next.isDirect = true;
   next.content = text;
   next.username = deviceId;
-  next.author = {
-    user: { id: deviceId, name: deviceId },
-    id: deviceId,
-    name: deviceId,
-    nick: deviceId,
-  } as any;
-  next.event.user = { id: deviceId, name: deviceId } as any;
+  next.event.user = { id: deviceId, name: deviceId, nick: deviceId } as any;
   next.event.channel = {
     id: channelId,
     type: Universal.Channel.Type.DIRECT,
