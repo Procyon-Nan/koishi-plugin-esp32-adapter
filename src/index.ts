@@ -109,8 +109,7 @@ interface LiveSessionEntry {
 
 const PRIVATE_PFX = "private:";
 
-// DeviceBot：参考 onebot 适配器的方式，使用真实 Koishi Bot 承载消息派发。
-// ChatLuna 将收到真正的 Session，而不是手工拼装的伪 Session。
+// DeviceBot：使用真实 Koishi Bot 承载设备消息与回复派发。
 class DeviceBot extends Bot<Context, any> {
   constructor(
     ctx: Context,
@@ -205,6 +204,38 @@ function createDeviceSession(
   next.elements = [h.text(text)] as any;
 
   return next;
+}
+
+function dispatchDeviceText(
+  logger: ReturnType<Context["logger"]>,
+  deviceBot: DeviceBot,
+  session: SessionState,
+  text: string,
+  messageId: string,
+  sourceLabel: string,
+) {
+  if (!text) {
+    logger.warn("device Bot 分发跳过：text 为空");
+    return;
+  }
+
+  const deviceId = session.remoteDeviceId || "unknown-device";
+  logger.info(`准备通过 device Bot 分发${sourceLabel} <- ${deviceId}: ${text}`);
+
+  const deviceSession = createDeviceSession(
+    deviceBot,
+    session,
+    text,
+    messageId,
+  );
+
+  Promise.resolve(deviceBot.dispatch(deviceSession))
+    .then(() => {
+      logger.info(`device Bot 已派发${sourceLabel} -> ${deviceId}`);
+    })
+    .catch((err: unknown) =>
+      logger.warn(`device Bot 派发${sourceLabel}失败: ${err}`),
+    );
 }
 
 // 从 Koishi h 元素树中递归提取纯文本。
@@ -918,28 +949,14 @@ function handleCommand(
       ),
     );
 
-    if (!text) {
-      logger.warn("device Bot 分发跳过：text 为空");
-      return;
-    }
-
-    const deviceId = session.remoteDeviceId || "unknown-device";
-    logger.info(`准备通过 device Bot 分发命令文本 <- ${deviceId}: ${text}`);
-
-    const deviceSession = createDeviceSession(
+    dispatchDeviceText(
+      logger,
       deviceBot,
       session,
       text,
       message.id,
+      "命令文本",
     );
-
-    Promise.resolve(deviceBot.dispatch(deviceSession))
-      .then(() => {
-        logger.info(`device Bot 已派发命令文本 -> ${deviceId}`);
-      })
-      .catch((err: unknown) =>
-        logger.warn(`device Bot 派发命令文本失败: ${err}`),
-      );
 
     return;
   }
@@ -968,28 +985,14 @@ function handleEvent(
 
     logger.info(`收到文本事件 <- ${session.remoteDeviceId}: ${text}`);
 
-    if (!text) {
-      logger.warn("device Bot 分发跳过：text 为空");
-      return;
-    }
-
-    const deviceId = session.remoteDeviceId || "unknown-device";
-    logger.info(`准备通过 device Bot 分发文本事件 <- ${deviceId}: ${text}`);
-
-    const deviceSession = createDeviceSession(
+    dispatchDeviceText(
+      logger,
       deviceBot,
       session,
       text,
       message.id,
+      "文本事件",
     );
-
-    Promise.resolve(deviceBot.dispatch(deviceSession))
-      .then(() => {
-        logger.info(`device Bot 已派发文本事件 -> ${deviceId}`);
-      })
-      .catch((err: unknown) =>
-        logger.warn(`device Bot 派发文本事件失败: ${err}`),
-      );
 
     return;
   }
